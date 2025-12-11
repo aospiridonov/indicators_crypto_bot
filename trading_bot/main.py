@@ -154,6 +154,10 @@ class TradingBotVWAP:
         self.peak_capital = None
         self.initial_balance = None
 
+        # Cached balance (pre-fetched before 4H candle close)
+        self.cached_balance = None
+        self.balance_prefetched = False
+
         # Strategy parameters
         self.base_leverage = self.config['leverage']
         self.min_leverage = self.config.get('min_leverage', 3)
@@ -241,6 +245,11 @@ class TradingBotVWAP:
                 # Clear position
                 self.position_tracker.close_position(position.action, exit_price, exit_reason, self.current_leverage)
 
+                # Fetch updated balance after position close
+                balance_info = self.exchange.fetch_balance()
+                new_balance = balance_info['free'] if balance_info else 0
+                self.cached_balance = new_balance  # Update cache
+
                 # Send notification
                 emoji = '✅' if pnl > 0 else '❌'
                 self.notifier.send(
@@ -249,10 +258,11 @@ class TradingBotVWAP:
                     f"Exit: ${exit_price:.2f}\n"
                     f"PnL: ${pnl:.2f} ({trade_data['pnl_pct']:.2f}%)\n"
                     f"Leverage: {self.current_leverage}x\n"
+                    f"Balance: ${new_balance:.2f}\n"
                     f"Win Streak: {self.consecutive_wins} | SL Streak: {self.consecutive_sl}"
                 )
 
-                logger.info(f"✅ Position closed via WebSocket, PnL: ${pnl:.2f}")
+                logger.info(f"✅ Position closed via WebSocket, PnL: ${pnl:.2f}, Balance: ${new_balance:.2f}")
 
         except Exception as e:
             logger.error(f"❌ Error handling WebSocket position update: {e}", exc_info=True)
@@ -276,10 +286,28 @@ class TradingBotVWAP:
             # Check for new signal (only if no open position)
             if not self.position_tracker.has_position():
                 logger.info("🔍 Checking for signal after 4H candle close...")
-                self.check_and_execute_signal()
+                # Use pre-fetched balance if available
+                self.check_and_execute_signal(use_cached_balance=True)
+
+            # Reset balance prefetch flag after candle close
+            self.balance_prefetched = False
 
         except Exception as e:
             logger.error(f"❌ Error handling kline update: {e}", exc_info=True)
+
+    def _prefetch_balance(self):
+        """
+        Pre-fetch balance ~3 minutes before 4H candle close
+        This allows instant trade execution when signal arrives
+        """
+        try:
+            balance_info = self.exchange.fetch_balance()
+            if balance_info:
+                self.cached_balance = balance_info['free']
+                self.balance_prefetched = True
+                logger.info(f"💰 Balance pre-fetched: ${self.cached_balance:.2f}")
+        except Exception as e:
+            logger.error(f"❌ Error pre-fetching balance: {e}")
 
     def update_adaptive_leverage(self, balance: float, open_position_exists: bool):
         """
@@ -333,9 +361,12 @@ class TradingBotVWAP:
             if prev_leverage != self.current_leverage:
                 logger.info(f"✅ Leverage restored to {self.current_leverage}x (wins: {self.consecutive_wins}, DD: {current_dd:.1f}%)")
 
-    def check_and_execute_signal(self):
+    def check_and_execute_signal(self, use_cached_balance: bool = False):
         """
         Check for trading signals and execute if found
+
+        Args:
+            use_cached_balance: If True, use pre-fetched balance instead of fetching new
         """
         try:
             # Check if trading is paused
@@ -359,13 +390,17 @@ class TradingBotVWAP:
                 logger.warning("Insufficient data for signal generation")
                 return
 
-            # Get current balance
-            balance_info = self.exchange.fetch_balance()
-            if balance_info is None:
-                logger.error("Failed to get balance")
-                return
-
-            balance = balance_info['free']
+            # Get balance (use cached if available and requested)
+            if use_cached_balance and self.cached_balance is not None:
+                balance = self.cached_balance
+                logger.debug(f"Using pre-fetched balance: ${balance:.2f}")
+            else:
+                balance_info = self.exchange.fetch_balance()
+                if balance_info is None:
+                    logger.error("Failed to get balance")
+                    return
+                balance = balance_info['free']
+                logger.info(f"💰 Balance fetched: ${balance:.2f}")
 
             # Update adaptive leverage
             self.update_adaptive_leverage(balance, False)
@@ -534,6 +569,11 @@ class TradingBotVWAP:
                     # Clear position
                     self.position_tracker.close_position(position.action, exit_price, exit_reason, self.current_leverage)
 
+                    # Fetch updated balance after position close
+                    balance_info = self.exchange.fetch_balance()
+                    new_balance = balance_info['free'] if balance_info else 0
+                    self.cached_balance = new_balance  # Update cache
+
                     # Send notification
                     emoji = '✅' if pnl_info['pnl'] > 0 else '❌'
                     self.notifier.send(
@@ -542,10 +582,11 @@ class TradingBotVWAP:
                         f"Exit: ${current_price:.2f}\n"
                         f"PnL: ${pnl_info['pnl']:.2f} ({pnl_info['pnl_pct']:.2f}%)\n"
                         f"Leverage: {self.current_leverage}x\n"
+                        f"Balance: ${new_balance:.2f}\n"
                         f"Win Streak: {self.consecutive_wins} | SL Streak: {self.consecutive_sl}"
                     )
 
-                    logger.info(f"✅ Position closed, PnL: ${pnl_info['pnl']:.2f}")
+                    logger.info(f"✅ Position closed, PnL: ${pnl_info['pnl']:.2f}, Balance: ${new_balance:.2f}")
 
         except Exception as e:
             logger.error(f"❌ Error checking position exit: {e}", exc_info=True)
@@ -577,31 +618,38 @@ class TradingBotVWAP:
             f"Mode: {'Demo' if os.getenv('BYBIT_DEMO_MODE', 'true').lower() == 'true' else 'LIVE'}"
         )
 
-        signal_check_interval = 300  # 5 minutes (for 4H strategy)
-        data_update_interval = 900  # 15 minutes
-        position_check_interval = 5  # 5 seconds
+        # Intervals for main loop
+        data_update_interval = 900  # 15 minutes - keep data fresh
+        position_check_interval = 30  # 30 seconds - check position timeout
 
-        last_signal_check = 0
         last_data_update = 0
         last_position_check = 0
+
+        # Signal checking is done via WebSocket callback (on 4H candle close)
+        # Balance is pre-fetched 3 minutes before candle close
 
         try:
             while True:
                 current_time = time.time()
+                now = datetime.utcnow()
 
-                # Update historical data
+                # Pre-fetch balance ~3 minutes before 4H candle close
+                # 4H candles close at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+                minutes = now.minute
+                hours = now.hour
+                is_near_4h_close = (hours % 4 == 3) and (minutes >= 57)  # XX:57-XX:59
+
+                if is_near_4h_close and not self.balance_prefetched:
+                    if not self.position_tracker.has_position():
+                        self._prefetch_balance()
+
+                # Update historical data periodically (backup, main updates via WebSocket)
                 if current_time - last_data_update >= data_update_interval:
-                    logger.debug("📊 Updating historical data...")
+                    logger.debug("📊 Periodic data update...")
                     self.data_manager.update_historical_data(self.exchange)
                     last_data_update = current_time
 
-                # Check for signals
-                if current_time - last_signal_check >= signal_check_interval:
-                    logger.debug("🔍 Checking for signals...")
-                    self.check_and_execute_signal()
-                    last_signal_check = current_time
-
-                # Check position exit (more frequent)
+                # Check position exit timeout (WebSocket handles TP/SL, this handles max_hold)
                 if current_time - last_position_check >= position_check_interval:
                     if self.position_tracker.has_position():
                         self.check_position_exit()
