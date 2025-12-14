@@ -174,9 +174,18 @@ class TradingDataManagerVWAP:
                 current_time = datetime.utcnow()
                 time_diff = current_time - last_timestamp
 
-                # Check if we need to update
-                if time_diff < timedelta(hours=4):
-                    logger.debug(f"⏱️ Last candle is {time_diff.total_seconds()/60:.0f}m old, no update needed yet")
+                # Calculate next expected candle close time
+                # 4H candles close at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+                last_hour = last_timestamp.hour
+                next_candle_hour = ((last_hour // 4) + 1) * 4
+                if next_candle_hour >= 24:
+                    next_candle_close = last_timestamp.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+                else:
+                    next_candle_close = last_timestamp.replace(hour=next_candle_hour, minute=0, second=0, microsecond=0)
+
+                # Check if next candle should have closed already
+                if current_time < next_candle_close:
+                    logger.debug(f"⏱️ Next candle closes at {next_candle_close}, no update needed yet")
                     return True
 
                 logger.info(f"📥 Incremental update: last candle is {time_diff.total_seconds()/3600:.1f}h old")
