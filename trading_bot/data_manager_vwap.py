@@ -246,3 +246,75 @@ class TradingDataManagerVWAP:
             'close': float(latest['close']),
             'volume': float(latest['volume'])
         }
+
+    def update_with_candle(self, candle: dict, exchange_connector) -> bool:
+        """
+        Update data with new candle from WebSocket.
+        Checks for gaps and fills them if needed.
+
+        Args:
+            candle: Candle data from WebSocket with keys: timestamp, open, high, low, close, volume
+            exchange_connector: BybitConnector instance for fetching missing data
+
+        Returns:
+            True if data is valid and ready for signal generation
+        """
+        try:
+            candle_ts = pd.to_datetime(candle['timestamp']) if isinstance(candle['timestamp'], str) else candle['timestamp']
+
+            # Check if we have existing data
+            if self.df_4h is None or len(self.df_4h) == 0:
+                logger.warning("⚠️ No historical data, fetching full dataset...")
+                return self.update_historical_data(exchange_connector)
+
+            last_ts = self.df_4h.index[-1]
+            expected_ts = last_ts + timedelta(hours=4)
+
+            # Check for gaps
+            time_diff = candle_ts - last_ts
+            expected_diff = timedelta(hours=4)
+
+            if time_diff > expected_diff + timedelta(minutes=5):
+                # Gap detected - need to fetch missing candles
+                gaps = int(time_diff.total_seconds() / (4 * 3600)) - 1
+                logger.warning(f"⚠️ Gap detected: {gaps} missing candles between {last_ts} and {candle_ts}")
+                logger.info(f"📥 Fetching missing data...")
+
+                # Fetch all missing candles
+                if not self.update_historical_data(exchange_connector):
+                    logger.error("❌ Failed to fill data gaps")
+                    return False
+
+                logger.info(f"✅ Data gaps filled")
+
+            # Add current candle if not duplicate
+            if candle_ts not in self.df_4h.index:
+                new_row = pd.DataFrame({
+                    'open': [float(candle['open'])],
+                    'high': [float(candle['high'])],
+                    'low': [float(candle['low'])],
+                    'close': [float(candle['close'])],
+                    'volume': [float(candle['volume'])]
+                }, index=[candle_ts])
+
+                self.df_4h = pd.concat([self.df_4h, new_row]).sort_index()
+                self.df_4h = self.df_4h[~self.df_4h.index.duplicated(keep='last')]
+
+                # Trim old data
+                max_bars_to_keep = self.min_bars * 2
+                if len(self.df_4h) > max_bars_to_keep:
+                    self.df_4h = self.df_4h.iloc[-max_bars_to_keep:]
+
+                logger.info(f"✅ Added candle {candle_ts}, total: {len(self.df_4h)} bars")
+                self.save_state()
+
+            # Validate data integrity
+            if len(self.df_4h) < self.min_bars:
+                logger.warning(f"⚠️ Insufficient data: {len(self.df_4h)} bars (need {self.min_bars})")
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Error updating with candle: {e}")
+            return False

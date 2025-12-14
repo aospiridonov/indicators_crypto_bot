@@ -280,11 +280,19 @@ class TradingBotVWAP:
 
             logger.info(f"🕯️ New 4H candle closed: ${candle['close']:.2f}")
 
-            # Update cached data with new candle
-            self.data_manager.update_historical_data(self.exchange)
+            # Update data with new candle (checks for gaps and fills them)
+            data_valid = self.data_manager.update_with_candle(candle, self.exchange)
 
-            # Check for new signal (only if no open position)
-            if not self.position_tracker.has_position():
+            if not data_valid:
+                logger.error("❌ Data validation failed, skipping signal check")
+                self.balance_prefetched = False
+                return
+
+            # Check position timeout (max_hold)
+            if self.position_tracker.has_position():
+                self.check_position_exit()
+            else:
+                # Check for new signal (only if no open position)
                 logger.info("🔍 Checking for signal after 4H candle close...")
                 # Use pre-fetched balance if available
                 self.check_and_execute_signal(use_cached_balance=True)
@@ -435,11 +443,9 @@ class TradingBotVWAP:
             # Place order
             order_result = self.exchange.place_market_order(
                 side='Buy' if signal['action'] == 'LONG' else 'Sell',
-                qty=None,  # Will calculate from size_usdt
+                amount_usdt=size_usdt,
                 tp_price=signal['tp_price'],
-                sl_price=signal['sl_price'],
-                leverage=self.current_leverage,
-                size_usdt=size_usdt
+                sl_price=signal['sl_price']
             )
 
             if order_result:
@@ -618,19 +624,13 @@ class TradingBotVWAP:
             f"Mode: {'Demo' if os.getenv('BYBIT_DEMO_MODE', 'true').lower() == 'true' else 'LIVE'}"
         )
 
-        # Intervals for main loop
-        data_update_interval = 900  # 15 minutes - keep data fresh
-        position_check_interval = 30  # 30 seconds - check position timeout
-
-        last_data_update = 0
-        last_position_check = 0
-
-        # Signal checking is done via WebSocket callback (on 4H candle close)
+        # All logic is handled via WebSocket callbacks:
+        # - Signal checking and position timeout on 4H candle close
+        # - Data updates on 4H candle close (with gap detection)
         # Balance is pre-fetched 3 minutes before candle close
 
         try:
             while True:
-                current_time = time.time()
                 now = datetime.utcnow()
 
                 # Pre-fetch balance ~3 minutes before 4H candle close
@@ -642,18 +642,6 @@ class TradingBotVWAP:
                 if is_near_4h_close and not self.balance_prefetched:
                     if not self.position_tracker.has_position():
                         self._prefetch_balance()
-
-                # Update historical data periodically (backup, main updates via WebSocket)
-                if current_time - last_data_update >= data_update_interval:
-                    logger.debug("📊 Periodic data update...")
-                    self.data_manager.update_historical_data(self.exchange)
-                    last_data_update = current_time
-
-                # Check position exit timeout (WebSocket handles TP/SL, this handles max_hold)
-                if current_time - last_position_check >= position_check_interval:
-                    if self.position_tracker.has_position():
-                        self.check_position_exit()
-                    last_position_check = current_time
 
                 time.sleep(1)
 
