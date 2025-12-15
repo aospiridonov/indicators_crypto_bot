@@ -192,17 +192,31 @@ class TradingBotVWAP:
 
                 # Get PnL from WebSocket (more accurate than calculation)
                 pnl = position_data.get('realised_pnl', 0.0)
-                exit_price = position_data.get('entry_price', 0.0)  # Bybit keeps entry_price even after close
-                tp_price = position_data.get('take_profit', 0.0)
-                sl_price = position_data.get('stop_loss', 0.0)
 
-                # Determine exit reason (TP or SL)
-                if tp_price > 0 and abs(exit_price - tp_price) < abs(exit_price - sl_price):
+                # Determine exit reason based on PnL sign (most reliable method)
+                # TP = profit, SL = loss
+                if pnl > 0:
                     exit_reason = 'TP'
-                elif sl_price > 0:
+                    # Calculate exit price from TP
+                    exit_price = position.tp_price
+                elif pnl < 0:
                     exit_reason = 'SL'
+                    # Calculate exit price from SL
+                    exit_price = position.sl_price
                 else:
+                    # PnL = 0, try to determine from position data
                     exit_reason = 'CLOSED'
+                    exit_price = position.entry_price
+
+                # If we have actual entry and can calculate, do it
+                if pnl != 0 and position.size_usdt > 0:
+                    # Calculate approximate exit price from PnL
+                    # PnL = (exit - entry) * qty for LONG, (entry - exit) * qty for SHORT
+                    qty = position.size_usdt / position.entry_price
+                    if position.action == 'LONG':
+                        exit_price = position.entry_price + (pnl / qty / self.current_leverage)
+                    else:
+                        exit_price = position.entry_price - (pnl / qty / self.current_leverage)
 
                 # Update streak counters
                 if exit_reason == 'SL':
@@ -482,8 +496,10 @@ class TradingBotVWAP:
                 self.position_tracker.open_position(position)
 
                 # Send notification
+                action_emoji = "📈" if signal['action'] == 'LONG' else "📉"
+                side_text = "Buy" if signal['action'] == 'LONG' else "Sell"
                 self.notifier.send(
-                    f"✅ {signal['action']} ORDER OPENED\n"
+                    f"{action_emoji} {signal['action']} ({side_text}) OPENED\n"
                     f"Leverage: {self.current_leverage}x\n"
                     f"Entry: ${real_entry_price:.2f} (slippage: {slippage_pct:+.3f}%)\n"
                     f"Expected: ${expected_entry:.2f}\n"
@@ -501,7 +517,8 @@ class TradingBotVWAP:
 
     def check_position_exit(self):
         """
-        Check if position should be exited based on TP/SL/Timeout
+        Check if position should be exited based on max_hold timeout.
+        TP/SL are handled by exchange, this only checks time-based exit.
         """
         try:
             if not self.position_tracker.has_position():
@@ -509,13 +526,8 @@ class TradingBotVWAP:
 
             position = self.position_tracker.get_open_positions()[0]
 
-            # Get current price from WebSocket
-            latest_ticker = self.ws_manager.get_latest_ticker()
-            if latest_ticker is None:
-                logger.warning("No ticker data from WebSocket")
-                return
-
-            current_price = float(latest_ticker['lastPrice'])
+            # Get current price from exchange API
+            current_price = self.exchange.get_current_price()
 
             # Check exit conditions
             exit_reason = position.check_exit(current_price)
@@ -527,8 +539,8 @@ class TradingBotVWAP:
                 logger.info(f"   Exit: ${current_price:.2f}")
                 logger.info(f"{'='*60}\n")
 
-                # Close position
-                close_result = self.exchange.close_position(reduce_only=True)
+                # Close position (pass 'long' or 'short' based on position action)
+                close_result = self.exchange.close_position(side=position.action.lower())
 
                 if close_result:
                     # Calculate PnL
