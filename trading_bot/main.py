@@ -129,13 +129,19 @@ class TradingBotVWAP:
         # Trade logger
         self.trade_logger = TradeLogger('data/trades_vwap.json')
 
-        # WebSocket manager (for position updates and 4H kline stream)
+        # WebSocket manager (for position updates, execution updates, and 4H kline stream)
         self.ws_manager = BybitWebSocketManager(
             symbol=self.config['symbol'],
             demo=use_demo,
             on_position_update=self._handle_websocket_position_update,
-            on_kline_update=self._handle_kline_update
+            on_kline_update=self._handle_kline_update,
+            on_execution=self._handle_execution_update
         )
+
+        # Pending execution data (for correlating with position close)
+        self._pending_execution = None
+        # Flag to prevent duplicate notifications when position closed via WebSocket
+        self._position_closed_via_ws = False
 
         # Telegram command handler (already starts polling in __init__)
         if telegram_enabled:
@@ -172,6 +178,30 @@ class TradingBotVWAP:
 
         logger.info("\n✅ Bot initialization complete!")
 
+    def _handle_execution_update(self, exec_data: Dict):
+        """
+        Handle execution (trade) update from WebSocket.
+        This provides accurate PnL and exit price when position is closed.
+
+        Args:
+            exec_data: Execution data from WebSocket
+        """
+        try:
+            if exec_data.get('event') == 'close':
+                # Store execution data for use in position close handler
+                self._pending_execution = {
+                    'exec_price': exec_data.get('exec_price', 0.0),
+                    'closed_pnl': exec_data.get('closed_pnl', 0.0),
+                    'order_type': exec_data.get('order_type', ''),
+                    'side': exec_data.get('side', '')
+                }
+                logger.info(f"Execution close received: price=${self._pending_execution['exec_price']:.2f}, "
+                           f"PnL=${self._pending_execution['closed_pnl']:+.2f}, "
+                           f"order={self._pending_execution['order_type']}")
+
+        except Exception as e:
+            logger.error(f"Error handling execution update: {e}", exc_info=True)
+
     def _handle_websocket_position_update(self, position_data: Dict):
         """
         Handle WebSocket position updates (when exchange closes position via TP/SL)
@@ -181,61 +211,94 @@ class TradingBotVWAP:
         """
         try:
             if position_data.get('event') == 'closed':
-                # Position closed by exchange (TP or SL hit)
-                logger.info(f"📬 WebSocket: Position closed by exchange")
+                logger.info(f"WebSocket: Position closed by exchange")
 
                 if not self.position_tracker.has_position():
-                    logger.warning("⚠️ Received position close but no tracked position")
+                    logger.warning("Received position close but no tracked position")
+                    self._pending_execution = None
                     return
 
                 position = self.position_tracker.get_open_positions()[0]
 
-                # Get PnL from WebSocket (more accurate than calculation)
-                pnl = position_data.get('realised_pnl', 0.0)
+                # Wait briefly for execution_stream if it hasn't arrived yet
+                # execution_stream provides accurate PnL, position_stream often arrives first
+                if not self._pending_execution:
+                    logger.info("Waiting for execution data...")
+                    time.sleep(0.5)  # Brief wait for execution_stream
 
-                # Determine exit reason based on PnL sign (most reliable method)
-                # TP = profit, SL = loss
-                if pnl > 0:
+                # Use execution data if available (more accurate)
+                if self._pending_execution:
+                    pnl = self._pending_execution.get('closed_pnl', 0.0)
+                    exit_price = self._pending_execution.get('exec_price', 0.0)
+                    order_type = self._pending_execution.get('order_type', '')
+                    logger.info(f"Using execution data: exit=${exit_price:.2f}, PnL=${pnl:+.2f}, order={order_type}")
+                else:
+                    # Fallback to position data (less accurate)
+                    pnl = position_data.get('realised_pnl', 0.0)
+                    exit_price = position_data.get('entry_price', 0.0)
+                    order_type = ''
+                    logger.warning("No execution data, using position data (may be inaccurate)")
+
+                tp_price = position.tp_price
+                sl_price = position.sl_price
+
+                # Determine exit reason by price proximity to TP/SL
+                # Note: TP/SL orders execute as Market type, so we can't use order_type
+                if exit_price > 0 and tp_price > 0 and sl_price > 0:
+                    tp_dist = abs(exit_price - tp_price)
+                    sl_dist = abs(exit_price - sl_price)
+                    # Allow 0.1% tolerance for price matching
+                    tp_tolerance = tp_price * 0.001
+                    sl_tolerance = sl_price * 0.001
+
+                    if tp_dist <= tp_tolerance:
+                        exit_reason = 'TP'
+                    elif sl_dist <= sl_tolerance:
+                        exit_reason = 'SL'
+                    else:
+                        # Price not close to TP or SL - manual close or timeout
+                        exit_reason = 'Manual'
+                elif pnl > 0:
                     exit_reason = 'TP'
-                    # Calculate exit price from TP
-                    exit_price = position.tp_price
                 elif pnl < 0:
                     exit_reason = 'SL'
-                    # Calculate exit price from SL
-                    exit_price = position.sl_price
                 else:
-                    # PnL = 0, try to determine from position data
-                    exit_reason = 'CLOSED'
-                    exit_price = position.entry_price
-
-                # If we have actual entry and can calculate, do it
-                if pnl != 0 and position.size_usdt > 0:
-                    # Calculate approximate exit price from PnL
-                    # PnL = (exit - entry) * qty for LONG, (entry - exit) * qty for SHORT
-                    qty = position.size_usdt / position.entry_price
-                    if position.action == 'LONG':
-                        exit_price = position.entry_price + (pnl / qty / self.current_leverage)
-                    else:
-                        exit_price = position.entry_price - (pnl / qty / self.current_leverage)
+                    exit_reason = 'Manual'
 
                 # Update streak counters
                 if exit_reason == 'SL':
                     self.consecutive_sl += 1
                     self.consecutive_wins = 0
 
-                    # Trigger pause
                     if self.consecutive_sl >= self.pause_threshold:
                         self.pause_until = datetime.utcnow() + timedelta(hours=self.pause_hours)
-                        logger.warning(f"⏸️ Trading paused until {self.pause_until} ({self.consecutive_sl} SL)")
+                        logger.warning(f"Trading paused until {self.pause_until} ({self.consecutive_sl} SL)")
                         self.notifier.send(
-                            f"⚠️ TRADING PAUSED\n"
+                            f"TRADING PAUSED\n"
                             f"Consecutive SL: {self.consecutive_sl}\n"
                             f"Resume at: {self.pause_until.strftime('%Y-%m-%d %H:%M')}"
                         )
-                else:
+                elif exit_reason == 'TP':
                     self.consecutive_sl = 0
+                    self.consecutive_wins += 1
+                else:
+                    # Manual - reset SL streak if profitable
                     if pnl > 0:
+                        self.consecutive_sl = 0
                         self.consecutive_wins += 1
+                    elif pnl < 0:
+                        self.consecutive_sl += 1
+                        self.consecutive_wins = 0
+
+                # Calculate PnL percentage (consistent with position_tracker.calculate_pnl)
+                # Formula: ((exit - entry) / entry) * 100 * leverage
+                if position.entry_price > 0 and exit_price > 0:
+                    if position.action == 'LONG':
+                        pnl_pct = ((exit_price - position.entry_price) / position.entry_price) * 100 * self.current_leverage
+                    else:  # SHORT
+                        pnl_pct = ((position.entry_price - exit_price) / position.entry_price) * 100 * self.current_leverage
+                else:
+                    pnl_pct = 0
 
                 # Log trade
                 trade_data = {
@@ -249,7 +312,7 @@ class TradingBotVWAP:
                     'leverage': self.current_leverage,
                     'exit_reason': exit_reason,
                     'pnl': pnl,
-                    'pnl_pct': (pnl / position.size_usdt) * 100 if position.size_usdt > 0 else 0,
+                    'pnl_pct': pnl_pct,
                     'consecutive_sl': self.consecutive_sl,
                     'consecutive_wins': self.consecutive_wins
                 }
@@ -259,27 +322,32 @@ class TradingBotVWAP:
                 # Clear position
                 self.position_tracker.close_position(position.action, exit_price, exit_reason, self.current_leverage)
 
-                # Fetch updated balance after position close
+                # Fetch updated balance
                 balance_info = self.exchange.fetch_balance()
                 new_balance = balance_info['free'] if balance_info else 0
-                self.cached_balance = new_balance  # Update cache
+                self.cached_balance = new_balance
 
                 # Send notification
-                emoji = '✅' if pnl > 0 else '❌'
+                emoji = '✅' if pnl > 0 else '❌' if pnl < 0 else '➖'
                 self.notifier.send(
                     f"{emoji} POSITION CLOSED: {exit_reason}\n"
                     f"Entry: ${position.entry_price:.2f}\n"
                     f"Exit: ${exit_price:.2f}\n"
-                    f"PnL: ${pnl:.2f} ({trade_data['pnl_pct']:.2f}%)\n"
+                    f"PnL: ${pnl:+.2f} ({pnl_pct:+.2f}%)\n"
                     f"Leverage: {self.current_leverage}x\n"
                     f"Balance: ${new_balance:.2f}\n"
                     f"Win Streak: {self.consecutive_wins} | SL Streak: {self.consecutive_sl}"
                 )
 
-                logger.info(f"✅ Position closed via WebSocket, PnL: ${pnl:.2f}, Balance: ${new_balance:.2f}")
+                logger.info(f"Position closed via WebSocket, PnL: ${pnl:+.2f}, Exit: ${exit_price:.2f}, Balance: ${new_balance:.2f}")
+
+                # Clear pending execution and set flag to prevent duplicate notifications
+                self._pending_execution = None
+                self._position_closed_via_ws = True
 
         except Exception as e:
-            logger.error(f"❌ Error handling WebSocket position update: {e}", exc_info=True)
+            logger.error(f"Error handling WebSocket position update: {e}", exc_info=True)
+            self._pending_execution = None
 
     def _handle_kline_update(self, candle: Dict):
         """
@@ -494,6 +562,8 @@ class TradingBotVWAP:
                 )
 
                 self.position_tracker.open_position(position)
+                # Reset WebSocket close flag when opening new position
+                self._position_closed_via_ws = False
 
                 # Send notification
                 action_emoji = "📈" if signal['action'] == 'LONG' else "📉"
@@ -521,6 +591,12 @@ class TradingBotVWAP:
         TP/SL are handled by exchange, this only checks time-based exit.
         """
         try:
+            # Skip if position was already closed via WebSocket (prevents duplicate notifications)
+            if self._position_closed_via_ws:
+                logger.info("Position already closed via WebSocket, skipping timeout check")
+                self._position_closed_via_ws = False
+                return
+
             if not self.position_tracker.has_position():
                 return
 
@@ -585,7 +661,7 @@ class TradingBotVWAP:
                     self.trade_logger.log_trade(trade_data)
 
                     # Clear position
-                    self.position_tracker.close_position(position.action, exit_price, exit_reason, self.current_leverage)
+                    self.position_tracker.close_position(position.action, current_price, exit_reason, self.current_leverage)
 
                     # Fetch updated balance after position close
                     balance_info = self.exchange.fetch_balance()
@@ -593,18 +669,18 @@ class TradingBotVWAP:
                     self.cached_balance = new_balance  # Update cache
 
                     # Send notification
-                    emoji = '✅' if pnl_info['pnl'] > 0 else '❌'
+                    emoji = '✅' if pnl_info['pnl'] > 0 else '❌' if pnl_info['pnl'] < 0 else '➖'
                     self.notifier.send(
                         f"{emoji} POSITION CLOSED: {exit_reason}\n"
                         f"Entry: ${position.entry_price:.2f}\n"
                         f"Exit: ${current_price:.2f}\n"
-                        f"PnL: ${pnl_info['pnl']:.2f} ({pnl_info['pnl_pct']:.2f}%)\n"
+                        f"PnL: ${pnl_info['pnl']:+.2f} ({pnl_info['pnl_pct']:+.2f}%)\n"
                         f"Leverage: {self.current_leverage}x\n"
                         f"Balance: ${new_balance:.2f}\n"
                         f"Win Streak: {self.consecutive_wins} | SL Streak: {self.consecutive_sl}"
                     )
 
-                    logger.info(f"✅ Position closed, PnL: ${pnl_info['pnl']:.2f}, Balance: ${new_balance:.2f}")
+                    logger.info(f"✅ Position closed, PnL: ${pnl_info['pnl']:+.2f}, Balance: ${new_balance:.2f}")
 
         except Exception as e:
             logger.error(f"❌ Error checking position exit: {e}", exc_info=True)
