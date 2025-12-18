@@ -522,8 +522,15 @@ class TradingBotVWAP:
             logger.info(f"{'='*60}\n")
 
             # Calculate position size
+            # position_size_pct is the percentage of balance to use as MARGIN
+            # Exposure (notional) = margin × leverage
             position_size_pct = self.config['position_size_pct']
-            size_usdt = balance * position_size_pct
+            leverage = self.config['leverage']
+            margin = balance * position_size_pct
+            size_usdt = margin * leverage  # This is the exposure/notional value
+
+            logger.info(f"   Margin: ${margin:.2f} ({position_size_pct*100:.0f}% of balance)")
+            logger.info(f"   Exposure: ${size_usdt:.2f} ({leverage}x leverage)")
 
             # Place order
             order_result = self.exchange.place_market_order(
