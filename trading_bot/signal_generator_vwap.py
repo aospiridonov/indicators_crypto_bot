@@ -86,7 +86,7 @@ class SignalGeneratorVWAP:
             vwap = cum_vol_price / cum_vol
 
             price_diff = group['close'] - vwap
-            std = price_diff.rolling(window=len(group), min_periods=1).std()
+            std = price_diff.rolling(window=len(group), min_periods=1).std(ddof=0)
 
             vwap_series.loc[group.index] = vwap
             std_series.loc[group.index] = std

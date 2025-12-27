@@ -426,7 +426,7 @@ class BybitWebSocketManager:
             candle = {
                 'symbol': symbol,
                 'interval': interval,
-                'timestamp': end_time,
+                'timestamp': start_time,  # Use start_time for consistency with historical data
                 'open': open_price,
                 'high': high_price,
                 'low': low_price,
